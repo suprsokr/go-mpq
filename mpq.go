@@ -462,6 +462,45 @@ func (a *Archive) decompressSectors(data []byte, block *blockTableEntryEx) ([]by
 	return result, nil
 }
 
+// ListFiles returns a list of files in the archive by reading the (listfile).
+func (a *Archive) ListFiles() ([]string, error) {
+	if a.mode != "r" {
+		return nil, fmt.Errorf("archive not opened for reading")
+	}
+
+	// Try to extract the listfile to a temp file
+	tmpFile, err := os.CreateTemp("", "mpq_listfile_*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpPath)
+
+	if err := a.ExtractFile("(listfile)", tmpPath); err != nil {
+		return nil, fmt.Errorf("extract listfile: %w", err)
+	}
+
+	data, err := os.ReadFile(tmpPath)
+	if err != nil {
+		return nil, fmt.Errorf("read listfile: %w", err)
+	}
+
+	// Parse listfile (one file per line, may have \r\n or \n)
+	content := strings.ReplaceAll(string(data), "\r\n", "\n")
+	lines := strings.Split(content, "\n")
+
+	var files []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && line != "(listfile)" {
+			files = append(files, line)
+		}
+	}
+
+	return files, nil
+}
+
 // HasFile returns true if the archive contains the specified file.
 // The mpqPath is the path within the archive (use backslashes or forward slashes).
 func (a *Archive) HasFile(mpqPath string) bool {
