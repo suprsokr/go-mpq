@@ -34,8 +34,15 @@ func (a *Archive) writeArchive() error {
 	}
 
 	// Write file data and build block table
-	a.blockTable = make([]blockTableEntryEx, len(a.pendingFiles))
+	// First pass: count actual files (excluding deletion markers might have no data)
+	actualFileCount := 0
+	for range a.pendingFiles {
+		actualFileCount++
+	}
+	
+	a.blockTable = make([]blockTableEntryEx, 0, actualFileCount)
 	listFileContent := ""
+	attributes := newAttributesWriter(len(a.pendingFiles))
 	needsHiBlockTable := false
 
 	for i, pf := range a.pendingFiles {
@@ -48,21 +55,81 @@ func (a *Archive) writeArchive() error {
 			needsHiBlockTable = true
 		}
 
-		// Compress the data
-		compressedData, err := compressData(pf.data)
-		if err != nil {
-			return fmt.Errorf("compress file %s: %w", pf.mpqPath, err)
+		var dataToWrite []byte
+		var flags uint32 = fileExists
+		var compressedSize uint32
+
+		// Handle deletion markers (no data)
+		if pf.isDeleteMarker {
+			flags = fileDeleteMarker | fileExists
+			compressedSize = 0
+
+			blockEntry := blockTableEntryEx{
+				blockTableEntry: blockTableEntry{
+					FilePos:        uint32(filePos),
+					CompressedSize: 0,
+					FileSize:       0,
+					Flags:          flags,
+				},
+				FilePosHi: uint16(filePos >> 32),
+			}
+			a.blockTable = append(a.blockTable, blockEntry)
+
+			if err := a.addToHashTable(pf.mpqPath, uint32(len(a.blockTable)-1)); err != nil {
+				return fmt.Errorf("add to hash table: %w", err)
+			}
+			listFileContent += pf.mpqPath + "\r\n"
+			continue
 		}
 
-		// Use compressed data only if smaller
-		var dataToWrite []byte
-		var flags uint32 = fileExists | fileSingleUnit // Always use single-unit for simplicity
+		// Determine if we should use sectors or single-unit
+		useSectors := len(pf.data) > int(a.sectorSize)*2 // Use sectors for larger files
+		useSectorCRC := pf.generateCRC
 
-		if len(compressedData) < len(pf.data) {
-			dataToWrite = compressedData
+		if useSectors {
+			// Sector-based file with optional CRC
+			dataToWrite, compressedSize, err = a.writeSectoredFile(pf.data, useSectorCRC)
+			if err != nil {
+				return fmt.Errorf("write sectored file %s: %w", pf.mpqPath, err)
+			}
 			flags |= fileCompress
+			if useSectorCRC {
+				flags |= fileSectorCRC
+			}
 		} else {
-			dataToWrite = pf.data
+			// Single-unit file
+			compressedData, err := compressData(pf.data)
+			if err != nil {
+				return fmt.Errorf("compress file %s: %w", pf.mpqPath, err)
+			}
+
+			flags |= fileSingleUnit
+
+			if len(compressedData) < len(pf.data) {
+				dataToWrite = compressedData
+				flags |= fileCompress
+			} else {
+				dataToWrite = pf.data
+			}
+
+			// Add single-unit CRC if requested
+			if useSectorCRC {
+				crc := adler32(dataToWrite)
+				crcBytes := make([]byte, 4)
+				crcBytes[0] = byte(crc)
+				crcBytes[1] = byte(crc >> 8)
+				crcBytes[2] = byte(crc >> 16)
+				crcBytes[3] = byte(crc >> 24)
+				dataToWrite = append(dataToWrite, crcBytes...)
+				flags |= fileSectorCRC
+			}
+
+			compressedSize = uint32(len(dataToWrite))
+		}
+
+		// Mark as patch file if requested
+		if pf.isPatchFile {
+			flags |= filePatchFile
 		}
 
 		if _, err := file.Write(dataToWrite); err != nil {
@@ -70,18 +137,20 @@ func (a *Archive) writeArchive() error {
 		}
 
 		// Add to block table
-		a.blockTable[i] = blockTableEntryEx{
+		blockEntry := blockTableEntryEx{
 			blockTableEntry: blockTableEntry{
 				FilePos:        uint32(filePos),
-				CompressedSize: uint32(len(dataToWrite)),
+				CompressedSize: compressedSize,
 				FileSize:       uint32(len(pf.data)),
 				Flags:          flags,
 			},
 			FilePosHi: uint16(filePos >> 32),
 		}
+		a.blockTable = append(a.blockTable, blockEntry)
+		attributes.setEntry(i, pf.data)
 
 		// Add to hash table
-		if err := a.addToHashTable(pf.mpqPath, uint32(i)); err != nil {
+		if err := a.addToHashTable(pf.mpqPath, uint32(len(a.blockTable)-1)); err != nil {
 			return fmt.Errorf("add to hash table: %w", err)
 		}
 
@@ -116,8 +185,7 @@ func (a *Archive) writeArchive() error {
 			return fmt.Errorf("write listfile: %w", err)
 		}
 
-		blockIndex := uint32(len(a.blockTable))
-		a.blockTable = append(a.blockTable, blockTableEntryEx{
+		blockEntry := blockTableEntryEx{
 			blockTableEntry: blockTableEntry{
 				FilePos:        uint32(listFilePos),
 				CompressedSize: uint32(len(dataToWrite)),
@@ -125,10 +193,56 @@ func (a *Archive) writeArchive() error {
 				Flags:          flags,
 			},
 			FilePosHi: uint16(listFilePos >> 32),
-		})
+		}
+		a.blockTable = append(a.blockTable, blockEntry)
 
-		if err := a.addToHashTable("(listfile)", blockIndex); err != nil {
+		if err := a.addToHashTable("(listfile)", uint32(len(a.blockTable)-1)); err != nil {
 			return fmt.Errorf("add listfile to hash table: %w", err)
+		}
+	}
+
+	// Add (attributes)
+	attributesData, err := attributes.build()
+	if err != nil {
+		return fmt.Errorf("build attributes: %w", err)
+	}
+	if len(attributesData) > 0 {
+		attrPos, _ := file.Seek(0, 1)
+		if attrPos > 0xFFFFFFFF {
+			needsHiBlockTable = true
+		}
+
+		compressedAttributes, err := compressData(attributesData)
+		if err != nil {
+			return fmt.Errorf("compress attributes: %w", err)
+		}
+
+		var attrToWrite []byte
+		var attrFlags uint32 = fileExists | fileSingleUnit
+		if len(compressedAttributes) < len(attributesData) {
+			attrToWrite = compressedAttributes
+			attrFlags |= fileCompress
+		} else {
+			attrToWrite = attributesData
+		}
+
+		if _, err := file.Write(attrToWrite); err != nil {
+			return fmt.Errorf("write attributes: %w", err)
+		}
+
+		blockEntry := blockTableEntryEx{
+			blockTableEntry: blockTableEntry{
+				FilePos:        uint32(attrPos),
+				CompressedSize: uint32(len(attrToWrite)),
+				FileSize:       uint32(len(attributesData)),
+				Flags:          attrFlags,
+			},
+			FilePosHi: uint16(attrPos >> 32),
+		}
+		a.blockTable = append(a.blockTable, blockEntry)
+
+		if err := a.addToHashTable("(attributes)", uint32(len(a.blockTable)-1)); err != nil {
+			return fmt.Errorf("add attributes to hash table: %w", err)
 		}
 	}
 
@@ -206,6 +320,92 @@ func (a *Archive) writeArchive() error {
 	}
 
 	return nil
+}
+
+// writeSectoredFile writes file data in sectors with optional CRC table.
+// Returns the complete data buffer, its size, and any error.
+func (a *Archive) writeSectoredFile(data []byte, useCRC bool) ([]byte, uint32, error) {
+	numSectors := (uint32(len(data)) + a.sectorSize - 1) / a.sectorSize
+
+	// Build sector offset table
+	offsetTable := make([]uint32, numSectors+1)
+	sectorCRCs := make([]uint32, 0, numSectors)
+	sectors := make([][]byte, numSectors)
+
+	// Calculate offset table size
+	offsetTableSize := (numSectors + 1) * 4
+	var crcTableSize uint32
+	if useCRC {
+		crcTableSize = numSectors * 4
+	}
+
+	// First offset points after offset table + CRC table
+	currentOffset := offsetTableSize + crcTableSize
+
+	// Compress each sector
+	for i := uint32(0); i < numSectors; i++ {
+		start := i * a.sectorSize
+		end := start + a.sectorSize
+		if end > uint32(len(data)) {
+			end = uint32(len(data))
+		}
+
+		sectorData := data[start:end]
+		compressed, err := compressData(sectorData)
+		if err != nil {
+			return nil, 0, fmt.Errorf("compress sector %d: %w", i, err)
+		}
+
+		// Use compressed data if smaller
+		if len(compressed) < len(sectorData) {
+			sectors[i] = compressed
+		} else {
+			sectors[i] = sectorData
+		}
+
+		offsetTable[i] = currentOffset
+		currentOffset += uint32(len(sectors[i]))
+
+		// Calculate CRC for the uncompressed sector data
+		if useCRC {
+			sectorCRCs = append(sectorCRCs, adler32(sectorData))
+		}
+	}
+
+	offsetTable[numSectors] = currentOffset
+
+	// Build final data buffer
+	totalSize := currentOffset
+	result := make([]byte, totalSize)
+
+	// Write offset table
+	offset := uint32(0)
+	for _, off := range offsetTable {
+		result[offset] = byte(off)
+		result[offset+1] = byte(off >> 8)
+		result[offset+2] = byte(off >> 16)
+		result[offset+3] = byte(off >> 24)
+		offset += 4
+	}
+
+	// Write CRC table if needed
+	if useCRC {
+		for _, crc := range sectorCRCs {
+			result[offset] = byte(crc)
+			result[offset+1] = byte(crc >> 8)
+			result[offset+2] = byte(crc >> 16)
+			result[offset+3] = byte(crc >> 24)
+			offset += 4
+		}
+	}
+
+	// Write sector data
+	for _, sector := range sectors {
+		copy(result[offset:], sector)
+		offset += uint32(len(sector))
+	}
+
+	return result, totalSize, nil
 }
 
 // addToHashTable adds a file to the hash table

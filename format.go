@@ -12,6 +12,10 @@ import (
 const (
 	// Magic signature "MPQ\x1A" in little-endian
 	mpqMagic = 0x1A51504D
+	// Magic signature "MPQ\x1B" for user data header
+	mpqUserDataMagic = 0x1B51504D
+	// Header alignment requirement
+	headerAlignment = 0x200
 
 	// Format versions
 	formatVersion1 = 0 // Original format (up to 4GB)
@@ -44,6 +48,14 @@ const (
 	defaultSectorSize      = 1 << defaultSectorSizeShift
 )
 
+// userDataHeader is the optional MPQ user data header (MPQ\x1B)
+type userDataHeader struct {
+	Magic             uint32
+	UserDataSize      uint32
+	HeaderOffset      uint32
+	UserDataHeaderSize uint32
+}
+
 // baseHeader is the MPQ archive header (V1 format - 32 bytes)
 type baseHeader struct {
 	Magic            uint32 // "MPQ\x1A"
@@ -68,6 +80,8 @@ type extendedHeader struct {
 type archiveHeader struct {
 	baseHeader
 	extendedHeader
+	ArchiveOffset uint64
+	UserData      *userDataHeader
 }
 
 // getHashTableOffset64 returns the full 64-bit hash table offset
@@ -147,6 +161,61 @@ func readArchiveHeader(r io.ReadSeeker) (*archiveHeader, error) {
 	}
 
 	return h, nil
+}
+
+// findArchiveHeader scans for an MPQ header, including user data headers.
+func findArchiveHeader(r io.ReadSeeker) (*archiveHeader, error) {
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+
+	var offset uint64
+	buf := make([]byte, 4)
+	for {
+		if _, err := r.Seek(int64(offset), io.SeekStart); err != nil {
+			return nil, err
+		}
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+		sig := binary.LittleEndian.Uint32(buf)
+		switch sig {
+		case mpqMagic:
+			// Seek back to start of header before reading
+			if _, err := r.Seek(int64(offset), io.SeekStart); err != nil {
+				return nil, err
+			}
+			header, err := readArchiveHeader(r)
+			if err != nil {
+				return nil, err
+			}
+			header.ArchiveOffset = offset
+			return header, nil
+		case mpqUserDataMagic:
+			var userHeader userDataHeader
+			if err := binary.Read(r, binary.LittleEndian, &userHeader); err != nil {
+				return nil, err
+			}
+			if userHeader.HeaderOffset == 0 {
+				return nil, io.ErrUnexpectedEOF
+			}
+			archiveOffset := offset + uint64(userHeader.HeaderOffset)
+			if _, err := r.Seek(int64(archiveOffset), io.SeekStart); err != nil {
+				return nil, err
+			}
+			header, err := readArchiveHeader(r)
+			if err != nil {
+				return nil, err
+			}
+			if header.Magic != mpqMagic {
+				return nil, io.ErrUnexpectedEOF
+			}
+			header.ArchiveOffset = archiveOffset
+			header.UserData = &userHeader
+			return header, nil
+		}
+		offset += headerAlignment
+	}
 }
 
 // writeArchiveHeader writes the MPQ header to a writer

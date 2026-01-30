@@ -463,3 +463,842 @@ func TestEncryptDecryptRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestSectorCRCGeneration(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_crc_test_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create test file
+	testFile := filepath.Join(tmpDir, "test.txt")
+	testContent := []byte("Test content for sector CRC validation")
+	if err := os.WriteFile(testFile, testContent, 0644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	// Create archive with CRC
+	mpqPath := filepath.Join(tmpDir, "test_crc.mpq")
+	archive, err := Create(mpqPath, 10)
+	if err != nil {
+		t.Fatalf("create archive: %v", err)
+	}
+
+	if err := archive.AddFileWithCRC(testFile, "Data\\Test.txt"); err != nil {
+		t.Fatalf("add file with CRC: %v", err)
+	}
+	archive.Close()
+
+	// Read back and verify
+	readArchive, err := Open(mpqPath)
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	defer readArchive.Close()
+
+	extractPath := filepath.Join(tmpDir, "extracted.txt")
+	if err := readArchive.ExtractFile("Data\\Test.txt", extractPath); err != nil {
+		t.Fatalf("extract file with CRC: %v", err)
+	}
+
+	extracted, _ := os.ReadFile(extractPath)
+	if string(extracted) != string(testContent) {
+		t.Errorf("content mismatch: got %q, want %q", extracted, testContent)
+	}
+}
+
+func TestPatchFileMarker(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_patch_test_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create patch file
+	patchFile := filepath.Join(tmpDir, "patch.dat")
+	patchContent := []byte("Patch data")
+	if err := os.WriteFile(patchFile, patchContent, 0644); err != nil {
+		t.Fatalf("write patch file: %v", err)
+	}
+
+	// Create archive with patch file
+	mpqPath := filepath.Join(tmpDir, "patch.mpq")
+	archive, err := Create(mpqPath, 10)
+	if err != nil {
+		t.Fatalf("create archive: %v", err)
+	}
+
+	if err := archive.AddPatchFile(patchFile, "Data\\Patch.dat"); err != nil {
+		t.Fatalf("add patch file: %v", err)
+	}
+	archive.Close()
+
+	// Read back and verify patch flag
+	readArchive, err := Open(mpqPath)
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	defer readArchive.Close()
+
+	if !readArchive.IsPatchFile("Data\\Patch.dat") {
+		t.Errorf("file not marked as patch file")
+	}
+}
+
+func TestDeletionMarker(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_delete_test_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create archive with deletion marker
+	mpqPath := filepath.Join(tmpDir, "delete.mpq")
+	archive, err := Create(mpqPath, 10)
+	if err != nil {
+		t.Fatalf("create archive: %v", err)
+	}
+
+	if err := archive.AddDeleteMarker("Data\\Deleted.txt"); err != nil {
+		t.Fatalf("add delete marker: %v", err)
+	}
+	archive.Close()
+
+	// Read back and verify
+	readArchive, err := Open(mpqPath)
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	defer readArchive.Close()
+
+	// File should exist but be marked for deletion
+	if !readArchive.IsDeleteMarker("Data\\Deleted.txt") {
+		t.Errorf("file not marked for deletion")
+	}
+
+	// HasFile should return false for deletion markers
+	if readArchive.HasFile("Data\\Deleted.txt") {
+		t.Errorf("HasFile returned true for deletion marker")
+	}
+}
+
+func TestPatchChain(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_chain_test_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create base archive
+	baseFile := filepath.Join(tmpDir, "base.txt")
+	baseContent := []byte("Base content")
+	os.WriteFile(baseFile, baseContent, 0644)
+
+	baseMPQ := filepath.Join(tmpDir, "base.mpq")
+	base, _ := Create(baseMPQ, 10)
+	base.AddFile(baseFile, "Data\\File.txt")
+	base.Close()
+
+	// Create patch archive
+	patchFile := filepath.Join(tmpDir, "patch.txt")
+	patchContent := []byte("Patched content")
+	os.WriteFile(patchFile, patchContent, 0644)
+
+	patchMPQ := filepath.Join(tmpDir, "patch.mpq")
+	patch, _ := Create(patchMPQ, 10)
+	patch.AddFile(patchFile, "Data\\File.txt")
+	patch.Close()
+
+	// Open as patch chain
+	chain, err := OpenPatchChain([]string{baseMPQ, patchMPQ})
+	if err != nil {
+		t.Fatalf("open patch chain: %v", err)
+	}
+	defer chain.Close()
+
+	// Extract should get patched version
+	extractPath := filepath.Join(tmpDir, "extracted.txt")
+	if err := chain.ExtractFile("Data\\File.txt", extractPath); err != nil {
+		t.Fatalf("extract from chain: %v", err)
+	}
+
+	extracted, _ := os.ReadFile(extractPath)
+	if string(extracted) != string(patchContent) {
+		t.Errorf("got base content, expected patch content")
+	}
+}
+
+func TestPatchChainDeletionMarker(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_chain_delete_test_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create base archive with file
+	baseFile := filepath.Join(tmpDir, "base.txt")
+	os.WriteFile(baseFile, []byte("Base content"), 0644)
+
+	baseMPQ := filepath.Join(tmpDir, "base.mpq")
+	base, _ := Create(baseMPQ, 10)
+	base.AddFile(baseFile, "Data\\File.txt")
+	base.Close()
+
+	// Create patch archive with deletion marker
+	patchMPQ := filepath.Join(tmpDir, "patch.mpq")
+	patch, _ := Create(patchMPQ, 10)
+	patch.AddDeleteMarker("Data\\File.txt")
+	patch.Close()
+
+	// Open as patch chain
+	chain, err := OpenPatchChain([]string{baseMPQ, patchMPQ})
+	if err != nil {
+		t.Fatalf("open patch chain: %v", err)
+	}
+	defer chain.Close()
+
+	// File should not be found (deleted in patch)
+	if chain.HasFile("Data\\File.txt") {
+		t.Errorf("file found despite deletion marker in patch")
+	}
+
+	// Extract should fail
+	extractPath := filepath.Join(tmpDir, "extracted.txt")
+	if err := chain.ExtractFile("Data\\File.txt", extractPath); err == nil {
+		t.Errorf("extract succeeded for deleted file")
+	}
+}
+
+// TestModifyArchive tests opening an archive for modification
+func TestModifyArchive(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_modify_test_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create initial archive with some files
+	file1 := filepath.Join(tmpDir, "file1.txt")
+	file2 := filepath.Join(tmpDir, "file2.txt")
+	os.WriteFile(file1, []byte("Original content 1"), 0644)
+	os.WriteFile(file2, []byte("Original content 2"), 0644)
+
+	mpqPath := filepath.Join(tmpDir, "test.mpq")
+	archive, err := Create(mpqPath, 10)
+	if err != nil {
+		t.Fatalf("create archive: %v", err)
+	}
+	archive.AddFile(file1, "Data\\File1.txt")
+	archive.AddFile(file2, "Data\\File2.txt")
+	if err := archive.Close(); err != nil {
+		t.Fatalf("close archive: %v", err)
+	}
+
+	// Open for modification
+	archive, err = OpenForModify(mpqPath)
+	if err != nil {
+		t.Fatalf("open for modify: %v", err)
+	}
+
+	// Add a new file
+	file3 := filepath.Join(tmpDir, "file3.txt")
+	os.WriteFile(file3, []byte("New file content"), 0644)
+	if err := archive.AddFile(file3, "Data\\File3.txt"); err != nil {
+		t.Fatalf("add new file: %v", err)
+	}
+
+	// Close and save modifications
+	if err := archive.Close(); err != nil {
+		t.Fatalf("close modified archive: %v", err)
+	}
+
+	// Open and verify all three files exist
+	archive, err = Open(mpqPath)
+	if err != nil {
+		t.Fatalf("open modified archive: %v", err)
+	}
+	defer archive.Close()
+
+	if !archive.HasFile("Data\\File1.txt") {
+		t.Errorf("original file 1 missing")
+	}
+	if !archive.HasFile("Data\\File2.txt") {
+		t.Errorf("original file 2 missing")
+	}
+	if !archive.HasFile("Data\\File3.txt") {
+		t.Errorf("new file 3 missing")
+	}
+
+	// Verify content
+	extractPath := filepath.Join(tmpDir, "extracted3.txt")
+	if err := archive.ExtractFile("Data\\File3.txt", extractPath); err != nil {
+		t.Fatalf("extract new file: %v", err)
+	}
+	content, _ := os.ReadFile(extractPath)
+	if string(content) != "New file content" {
+		t.Errorf("new file content mismatch: got %q, want %q", content, "New file content")
+	}
+}
+
+// TestModifyRemoveFile tests removing files from an archive
+func TestModifyRemoveFile(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_remove_test_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create initial archive with files
+	file1 := filepath.Join(tmpDir, "file1.txt")
+	file2 := filepath.Join(tmpDir, "file2.txt")
+	os.WriteFile(file1, []byte("Content 1"), 0644)
+	os.WriteFile(file2, []byte("Content 2"), 0644)
+
+	mpqPath := filepath.Join(tmpDir, "test.mpq")
+	archive, _ := Create(mpqPath, 10)
+	archive.AddFile(file1, "Data\\File1.txt")
+	archive.AddFile(file2, "Data\\File2.txt")
+	archive.Close()
+
+	// Open for modification and remove a file
+	archive, err = OpenForModify(mpqPath)
+	if err != nil {
+		t.Fatalf("open for modify: %v", err)
+	}
+
+	if err := archive.RemoveFile("Data\\File1.txt"); err != nil {
+		t.Fatalf("remove file: %v", err)
+	}
+
+	if err := archive.Close(); err != nil {
+		t.Fatalf("close modified archive: %v", err)
+	}
+
+	// Open and verify file1 is gone, file2 remains
+	archive, err = Open(mpqPath)
+	if err != nil {
+		t.Fatalf("open modified archive: %v", err)
+	}
+	defer archive.Close()
+
+	if archive.HasFile("Data\\File1.txt") {
+		t.Errorf("removed file still present")
+	}
+	if !archive.HasFile("Data\\File2.txt") {
+		t.Errorf("remaining file missing")
+	}
+}
+
+// TestModifyReplaceFile tests replacing an existing file
+func TestModifyReplaceFile(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_replace_test_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create initial archive
+	file1 := filepath.Join(tmpDir, "file1.txt")
+	os.WriteFile(file1, []byte("Original content"), 0644)
+
+	mpqPath := filepath.Join(tmpDir, "test.mpq")
+	archive, _ := Create(mpqPath, 10)
+	archive.AddFile(file1, "Data\\File.txt")
+	archive.Close()
+
+	// Open for modification and replace the file
+	archive, err = OpenForModify(mpqPath)
+	if err != nil {
+		t.Fatalf("open for modify: %v", err)
+	}
+
+	file1New := filepath.Join(tmpDir, "file1_new.txt")
+	os.WriteFile(file1New, []byte("Replaced content"), 0644)
+	if err := archive.AddFile(file1New, "Data\\File.txt"); err != nil {
+		t.Fatalf("replace file: %v", err)
+	}
+
+	if err := archive.Close(); err != nil {
+		t.Fatalf("close modified archive: %v", err)
+	}
+
+	// Open and verify content is updated
+	archive, err = Open(mpqPath)
+	if err != nil {
+		t.Fatalf("open modified archive: %v", err)
+	}
+	defer archive.Close()
+
+	extractPath := filepath.Join(tmpDir, "extracted.txt")
+	if err := archive.ExtractFile("Data\\File.txt", extractPath); err != nil {
+		t.Fatalf("extract file: %v", err)
+	}
+
+	content, _ := os.ReadFile(extractPath)
+	if string(content) != "Replaced content" {
+		t.Errorf("file content mismatch: got %q, want %q", content, "Replaced content")
+	}
+}
+
+// TestModifyWithCRC tests modifying an archive with CRC files
+func TestModifyWithCRC(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_modify_crc_test_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create archive with CRC
+	file1 := filepath.Join(tmpDir, "file1.txt")
+	os.WriteFile(file1, []byte("Content with CRC"), 0644)
+
+	mpqPath := filepath.Join(tmpDir, "test.mpq")
+	archive, _ := Create(mpqPath, 10)
+	archive.AddFileWithCRC(file1, "Data\\File.txt")
+	archive.Close()
+
+	// Modify the archive
+	archive, err = OpenForModify(mpqPath)
+	if err != nil {
+		t.Fatalf("open for modify: %v", err)
+	}
+
+	file2 := filepath.Join(tmpDir, "file2.txt")
+	os.WriteFile(file2, []byte("New file"), 0644)
+	archive.AddFile(file2, "Data\\File2.txt")
+	archive.Close()
+
+	// Verify both files work
+	archive, err = Open(mpqPath)
+	if err != nil {
+		t.Fatalf("open modified archive: %v", err)
+	}
+	defer archive.Close()
+
+	extractPath1 := filepath.Join(tmpDir, "extracted1.txt")
+	if err := archive.ExtractFile("Data\\File.txt", extractPath1); err != nil {
+		t.Fatalf("extract CRC file: %v", err)
+	}
+	content1, _ := os.ReadFile(extractPath1)
+	if string(content1) != "Content with CRC" {
+		t.Errorf("CRC file content mismatch: got %q, want %q", content1, "Content with CRC")
+	}
+
+	extractPath2 := filepath.Join(tmpDir, "extracted2.txt")
+	if err := archive.ExtractFile("Data\\File2.txt", extractPath2); err != nil {
+		t.Fatalf("extract new file: %v", err)
+	}
+	content2, _ := os.ReadFile(extractPath2)
+	if string(content2) != "New file" {
+		t.Errorf("new file content mismatch: got %q, want %q", content2, "New file")
+	}
+}
+
+// TestCRC32Algorithm verifies the CRC32 algorithm matches expected values
+func TestCRC32Algorithm(t *testing.T) {
+	testCases := []struct {
+		data     []byte
+		expected uint32
+	}{
+		{[]byte(""), 0x00000000},
+		{[]byte("a"), 0xE8B7BE43},
+		{[]byte("abc"), 0x352441C2},
+		{[]byte("Hello, World!"), 0xEC4AC3D0},
+		{[]byte("The quick brown fox jumps over the lazy dog"), 0x414FA339},
+	}
+
+	for _, tc := range testCases {
+		got := crc32(tc.data)
+		if got != tc.expected {
+			t.Errorf("CRC32 mismatch for %q: got 0x%08X, expected 0x%08X",
+				tc.data, got, tc.expected)
+		}
+	}
+}
+
+// TestAdler32Algorithm verifies the Adler32 algorithm
+func TestAdler32Algorithm(t *testing.T) {
+	testCases := []struct {
+		data     []byte
+		expected uint32
+	}{
+		{[]byte(""), 0x00000001},
+		{[]byte("a"), 0x00620062},
+		{[]byte("abc"), 0x024D0127},
+		{[]byte("Wikipedia"), 0x11E60398},
+	}
+
+	for _, tc := range testCases {
+		got := adler32(tc.data)
+		if got != tc.expected {
+			t.Errorf("Adler32 mismatch for %q: got 0x%08X, expected 0x%08X",
+				tc.data, got, tc.expected)
+		}
+	}
+}
+
+// TestMultiSectorFileCRCGeneration tests CRC generation for files spanning multiple sectors
+func TestMultiSectorFileCRCGeneration(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_multi_sector_crc_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create test data that spans multiple sectors (3.25 sectors)
+	sectorSize := 4096
+	testData := make([]byte, sectorSize*3+1024)
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+	testFile := filepath.Join(tmpDir, "large.bin")
+	if err := os.WriteFile(testFile, testData, 0644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	// Build archive with CRC generation enabled
+	mpqPath := filepath.Join(tmpDir, "test_multi_crc.mpq")
+	archive, err := Create(mpqPath, 10)
+	if err != nil {
+		t.Fatalf("create archive: %v", err)
+	}
+
+	if err := archive.AddFileWithCRC(testFile, "Data\\Large.bin"); err != nil {
+		t.Fatalf("add file with CRC: %v", err)
+	}
+	archive.Close()
+
+	// Open and verify the archive
+	readArchive, err := Open(mpqPath)
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	defer readArchive.Close()
+
+	// Read the file - this should validate CRCs for all sectors
+	extractPath := filepath.Join(tmpDir, "extracted.bin")
+	if err := readArchive.ExtractFile("Data\\Large.bin", extractPath); err != nil {
+		t.Fatalf("extract file with CRC: %v", err)
+	}
+
+	extracted, _ := os.ReadFile(extractPath)
+	if len(extracted) != len(testData) {
+		t.Errorf("size mismatch: got %d, want %d", len(extracted), len(testData))
+	}
+
+	for i := range testData {
+		if extracted[i] != testData[i] {
+			t.Fatalf("data mismatch at byte %d", i)
+		}
+	}
+
+	// Verify CRC flag is set
+	block, err := readArchive.findFile("Data\\Large.bin")
+	if err != nil {
+		t.Fatalf("find file: %v", err)
+	}
+	if block.Flags&fileSectorCRC == 0 {
+		t.Errorf("file should have SECTOR_CRC flag set")
+	}
+}
+
+// TestNoCRCGeneration tests that archives without CRC generation work correctly
+func TestNoCRCGeneration(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_no_crc_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create test data
+	testData := []byte("Test file without CRC")
+	testFile := filepath.Join(tmpDir, "no_crc.txt")
+	if err := os.WriteFile(testFile, testData, 0644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	// Build archive without CRC generation (default)
+	mpqPath := filepath.Join(tmpDir, "test_no_crc.mpq")
+	archive, _ := Create(mpqPath, 10)
+	archive.AddFile(testFile, "Data\\NoCRC.txt")
+	archive.Close()
+
+	// Open and verify the archive
+	readArchive, _ := Open(mpqPath)
+	defer readArchive.Close()
+
+	// Read the file
+	extractPath := filepath.Join(tmpDir, "extracted.txt")
+	readArchive.ExtractFile("Data\\NoCRC.txt", extractPath)
+
+	extracted, _ := os.ReadFile(extractPath)
+	if string(extracted) != string(testData) {
+		t.Errorf("content mismatch")
+	}
+
+	// Check file info to verify CRC flag is NOT set
+	block, _ := readArchive.findFile("Data\\NoCRC.txt")
+	if block.Flags&fileSectorCRC != 0 {
+		t.Errorf("file should NOT have SECTOR_CRC flag set")
+	}
+}
+
+// TestCRCGenerationWithCompression tests CRC generation with compressed files
+func TestCRCGenerationWithCompression(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_compressed_crc_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create compressible test data - make it large enough for sectors (>8KB)
+	testData := []byte{}
+	for i := 0; i < 2000; i++ {
+		testData = append(testData, []byte("Hello World! This is compressible data. ")...)
+	}
+	testFile := filepath.Join(tmpDir, "compressible.txt")
+	if err := os.WriteFile(testFile, testData, 0644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	// Build archive with CRC generation and compression enabled
+	mpqPath := filepath.Join(tmpDir, "test_compressed_crc.mpq")
+	archive, _ := Create(mpqPath, 10)
+	archive.AddFileWithCRC(testFile, "Data\\Compressible.txt")
+	archive.Close()
+
+	// Open and verify the archive
+	readArchive, _ := Open(mpqPath)
+	defer readArchive.Close()
+
+	// Read the file - this should decompress and validate CRC
+	extractPath := filepath.Join(tmpDir, "extracted.txt")
+	err = readArchive.ExtractFile("Data\\Compressible.txt", extractPath)
+	if err != nil {
+		t.Fatalf("extract file: %v", err)
+	}
+
+	extracted, _ := os.ReadFile(extractPath)
+	if len(extracted) != len(testData) {
+		t.Errorf("size mismatch: got %d, want %d", len(extracted), len(testData))
+	}
+
+	// Check file info
+	block, _ := readArchive.findFile("Data\\Compressible.txt")
+	if block.Flags&fileSectorCRC == 0 {
+		t.Errorf("file should have SECTOR_CRC flag set")
+	}
+	if block.Flags&fileCompress == 0 {
+		t.Errorf("file should be compressed")
+	}
+}
+
+// TestAttributesRoundtrip tests that attributes can be written and read back
+func TestAttributesRoundtrip(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_attributes_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create test files
+	file1Data := []byte("File 1 content")
+	file2Data := []byte("File 2 content")
+	file1Path := filepath.Join(tmpDir, "file1.txt")
+	file2Path := filepath.Join(tmpDir, "file2.txt")
+	os.WriteFile(file1Path, file1Data, 0644)
+	os.WriteFile(file2Path, file2Data, 0644)
+
+	// Build archive
+	mpqPath := filepath.Join(tmpDir, "test_attributes.mpq")
+	archive, _ := Create(mpqPath, 10)
+	archive.AddFile(file1Path, "Data\\File1.txt")
+	archive.AddFile(file2Path, "Data\\File2.txt")
+	archive.Close()
+
+	// Open and verify attributes exist
+	readArchive, _ := Open(mpqPath)
+	defer readArchive.Close()
+
+	if !readArchive.HasFile("(attributes)") {
+		t.Errorf("archive should contain (attributes) file")
+	}
+
+	// Extract attributes and verify it's not empty
+	attrPath := filepath.Join(tmpDir, "attributes")
+	err = readArchive.ExtractFile("(attributes)", attrPath)
+	if err != nil {
+		t.Fatalf("failed to extract attributes: %v", err)
+	}
+
+	attrData, _ := os.ReadFile(attrPath)
+	if len(attrData) < 8 {
+		t.Errorf("attributes file too small: %d bytes", len(attrData))
+	}
+}
+
+// TestPatchChainFileLocation tests tracking which archive contains a file
+func TestPatchChainFileLocation(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_chain_location_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create base archive with file
+	baseFile := filepath.Join(tmpDir, "base.txt")
+	os.WriteFile(baseFile, []byte("base content"), 0644)
+	baseMPQ := filepath.Join(tmpDir, "base.mpq")
+	base, _ := Create(baseMPQ, 10)
+	base.AddFile(baseFile, "Data\\Base.txt")
+	base.Close()
+
+	// Create patch archive with different file
+	patchFile := filepath.Join(tmpDir, "patch.txt")
+	os.WriteFile(patchFile, []byte("patch content"), 0644)
+	patchMPQ := filepath.Join(tmpDir, "patch.mpq")
+	patch, _ := Create(patchMPQ, 10)
+	patch.AddFile(patchFile, "Data\\Patch.txt")
+	patch.Close()
+
+	// Open as patch chain
+	chain, err := OpenPatchChain([]string{baseMPQ, patchMPQ})
+	if err != nil {
+		t.Fatalf("open patch chain: %v", err)
+	}
+	defer chain.Close()
+
+	// Verify both files are accessible
+	if !chain.HasFile("Data\\Base.txt") {
+		t.Errorf("base file should be accessible")
+	}
+	if !chain.HasFile("Data\\Patch.txt") {
+		t.Errorf("patch file should be accessible")
+	}
+	if chain.HasFile("Data\\Nonexistent.txt") {
+		t.Errorf("nonexistent file should not be found")
+	}
+}
+
+// TestPatchChainListing tests listing unique files across patch chain
+func TestPatchChainListing(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_chain_listing_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create base archive
+	base1 := filepath.Join(tmpDir, "file1.txt")
+	base2 := filepath.Join(tmpDir, "file2.txt")
+	os.WriteFile(base1, []byte("1"), 0644)
+	os.WriteFile(base2, []byte("2"), 0644)
+	baseMPQ := filepath.Join(tmpDir, "base.mpq")
+	base, _ := Create(baseMPQ, 10)
+	base.AddFile(base1, "Data\\File1.txt")
+	base.AddFile(base2, "Data\\File2.txt")
+	base.Close()
+
+	// Create patch archive (overrides file2, adds file3)
+	patch2 := filepath.Join(tmpDir, "file2_patched.txt")
+	patch3 := filepath.Join(tmpDir, "file3.txt")
+	os.WriteFile(patch2, []byte("2-patched"), 0644)
+	os.WriteFile(patch3, []byte("3"), 0644)
+	patchMPQ := filepath.Join(tmpDir, "patch.mpq")
+	patch, _ := Create(patchMPQ, 10)
+	patch.AddFile(patch2, "Data\\File2.txt")
+	patch.AddFile(patch3, "Data\\File3.txt")
+	patch.Close()
+
+	// Open as patch chain
+	chain, err := OpenPatchChain([]string{baseMPQ, patchMPQ})
+	if err != nil {
+		t.Fatalf("open patch chain: %v", err)
+	}
+	defer chain.Close()
+
+	// List files
+	files, err := chain.ListFiles()
+	if err != nil {
+		t.Fatalf("list files: %v", err)
+	}
+
+	// Filter out special files
+	var userFiles []string
+	for _, f := range files {
+		if f != "(listfile)" && f != "(attributes)" {
+			userFiles = append(userFiles, f)
+		}
+	}
+
+	// Should have 3 unique files
+	if len(userFiles) != 3 {
+		t.Errorf("expected 3 files, got %d: %v", len(userFiles), userFiles)
+	}
+
+	// Check all files are present
+	hasFile1 := false
+	hasFile2 := false
+	hasFile3 := false
+	for _, f := range userFiles {
+		switch f {
+		case "Data\\File1.txt":
+			hasFile1 = true
+		case "Data\\File2.txt":
+			hasFile2 = true
+		case "Data\\File3.txt":
+			hasFile3 = true
+		}
+	}
+
+	if !hasFile1 || !hasFile2 || !hasFile3 {
+		t.Errorf("missing files: file1=%v, file2=%v, file3=%v", hasFile1, hasFile2, hasFile3)
+	}
+}
+
+// TestMultiplePatchChain tests a chain with multiple patches
+func TestMultiplePatchChain(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mpq_multi_patch_")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create base archive
+	createVersionArchive := func(name, version string) string {
+		versionFile := filepath.Join(tmpDir, name+".txt")
+		os.WriteFile(versionFile, []byte(version), 0644)
+		mpqPath := filepath.Join(tmpDir, name+".mpq")
+		archive, _ := Create(mpqPath, 10)
+		archive.AddFile(versionFile, "Data\\Version.txt")
+		archive.Close()
+		return mpqPath
+	}
+
+	basePath := createVersionArchive("base", "1.0.0")
+	patch1Path := createVersionArchive("patch-1", "1.1.0")
+	patch2Path := createVersionArchive("patch-2", "1.2.0")
+	patch3Path := createVersionArchive("patch-3", "1.3.0")
+
+	// Build chain with all patches
+	chain, err := OpenPatchChain([]string{basePath, patch1Path, patch2Path, patch3Path})
+	if err != nil {
+		t.Fatalf("open patch chain: %v", err)
+	}
+	defer chain.Close()
+
+	// Highest priority patch should win
+	extractPath := filepath.Join(tmpDir, "version.txt")
+	chain.ExtractFile("Data\\Version.txt", extractPath)
+	version, _ := os.ReadFile(extractPath)
+
+	if string(version) != "1.3.0" {
+		t.Errorf("expected version 1.3.0, got %s", version)
+	}
+
+	// Verify chain has correct number of archives
+	if chain.GetArchiveCount() != 4 {
+		t.Errorf("expected 4 archives in chain, got %d", chain.GetArchiveCount())
+	}
+}
