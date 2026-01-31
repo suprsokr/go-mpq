@@ -224,7 +224,7 @@ func Open(path string) (*Archive, error) {
 		header:     header,
 		hashTable:  hashTable,
 		blockTable: blockTable,
-		sectorSize: 1 << header.SectorSizeShift,
+		sectorSize: 512 << header.SectorSizeShift,
 	}, nil
 }
 
@@ -354,7 +354,7 @@ func OpenForModify(path string) (*Archive, error) {
 		blockTable:    blockTable,
 		pendingFiles:  make([]pendingFile, 0),
 		removedFiles:  make(map[string]bool),
-		sectorSize:    1 << header.SectorSizeShift,
+		sectorSize:    512 << header.SectorSizeShift,
 		formatVersion: formatVer,
 	}, nil
 }

@@ -44,8 +44,8 @@ const (
 	localeNeutral = 0x00000000
 
 	// Default sector size (4096 bytes = 2^12)
-	defaultSectorSizeShift = 12
-	defaultSectorSize      = 1 << defaultSectorSizeShift
+	defaultSectorSizeShift = 3                             // 512 << 3 = 4096 bytes (WoW standard)
+	defaultSectorSize      = 512 << defaultSectorSizeShift // Must use 512 as base, not 1
 )
 
 // userDataHeader is the optional MPQ user data header (MPQ\x1B)
