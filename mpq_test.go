@@ -124,10 +124,10 @@ func TestHashStringFromStormLib(t *testing.T) {
 	// {0x8bd6929a, 0xfd55129b, "ReplaceableTextures\\CommandButtons\\BTNHaboss79.blp"}
 	// dwHash1 = HashA, dwHash2 = HashB
 	tests := []struct {
-		name     string
-		input    string
-		hashA    uint32 // hashTypeNameA (1)
-		hashB    uint32 // hashTypeNameB (2)
+		name  string
+		input string
+		hashA uint32 // hashTypeNameA (1)
+		hashB uint32 // hashTypeNameB (2)
 	}{
 		{
 			name:  "StormLib test file path",
