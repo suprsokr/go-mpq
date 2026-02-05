@@ -329,6 +329,7 @@ This library provides comprehensive MPQ v1 and v2 format support for games throu
 |---------|:------:|-------|
 | Multiple archives | ✅ | Priority-based file resolution |
 | File overrides | ✅ | Higher priority archive wins |
+| Optimized lookups | ✅ | O(1) HashMap cache for fast file resolution |
 | Deletion markers | ✅ | Mark files as deleted in patches |
 | Patch file markers | ✅ | FILE_PATCH_FILE flag support |
 | File location tracking | ✅ | Identify source archive for files |
