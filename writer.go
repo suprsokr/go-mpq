@@ -40,9 +40,18 @@ func (a *Archive) writeArchive() error {
 		actualFileCount++
 	}
 	
-	a.blockTable = make([]blockTableEntryEx, 0, actualFileCount)
+	// Calculate total block count including special files
+	// We'll add: (listfile) and (attributes) if they exist
+	totalBlockCount := actualFileCount
+	if actualFileCount > 0 {
+		totalBlockCount++ // (listfile)
+		totalBlockCount++ // (attributes)
+	}
+	
+	a.blockTable = make([]blockTableEntryEx, 0, totalBlockCount)
 	listFileContent := ""
-	attributes := newAttributesWriter(len(a.pendingFiles))
+	// Attributes file must include entries for ALL files in block table
+	attributes := newAttributesWriter(totalBlockCount)
 	needsHiBlockTable := false
 
 	for i, pf := range a.pendingFiles {
@@ -196,12 +205,25 @@ func (a *Archive) writeArchive() error {
 		}
 		a.blockTable = append(a.blockTable, blockEntry)
 
+		// Add attributes entry for (listfile) - use index after user files
+		listFileIndex := len(a.pendingFiles)
+		attributes.setEntry(listFileIndex, listFileData)
+
 		if err := a.addToHashTable("(listfile)", uint32(len(a.blockTable)-1)); err != nil {
 			return fmt.Errorf("add listfile to hash table: %w", err)
 		}
 	}
 
 	// Add (attributes)
+	// Calculate attributes index for the (attributes) file itself
+	attributesIndex := len(a.pendingFiles)
+	if listFileContent != "" {
+		attributesIndex++ // Account for (listfile)
+	}
+	// Set CRC32 to 0 for the (attributes) file entry (standard practice)
+	attributes.setEntry(attributesIndex, nil)
+
+	// Build attributes with all entries (including (attributes) file with CRC32=0)
 	attributesData, err := attributes.build()
 	if err != nil {
 		return fmt.Errorf("build attributes: %w", err)
@@ -293,14 +315,21 @@ func (a *Archive) writeArchive() error {
 		}
 	}
 
-	// Get archive size
-	archiveSize, _ := file.Seek(0, 1)
+	// Get archive size (total file size from start of header)
+	totalFileSize, _ := file.Seek(0, 1)
+	
+	// Archive size in header should be the size of the archive data section
+	// (everything after the header), not the total file size.
+	// This is what warcraft-rs expects for validation.
+	archiveSize := uint32(totalFileSize) - a.header.HeaderSize
 
 	// Update header
+	// Note: Offsets are relative to archive start (including header), which matches
+	// how warcraft-rs interprets them: archive_offset + header.get_hash_table_pos()
 	a.header.setHashTableOffset64(uint64(hashTableOffset))
 	a.header.setBlockTableOffset64(uint64(blockTableOffset))
 	a.header.BlockTableSize = uint32(len(a.blockTable))
-	a.header.ArchiveSize = uint32(archiveSize)
+	a.header.ArchiveSize = archiveSize
 
 	if a.formatVersion == FormatV2 {
 		if needsHiBlockTable {

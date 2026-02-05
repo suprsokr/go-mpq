@@ -24,7 +24,12 @@ func (a *attributesWriter) setEntry(index int, data []byte) {
 	if index < 0 || index >= len(a.crc32) {
 		return
 	}
-	a.crc32[index] = crc32(data)
+	if data == nil {
+		// Set CRC32 to 0 (used for placeholder entries like attributes file itself)
+		a.crc32[index] = 0
+	} else {
+		a.crc32[index] = crc32(data)
+	}
 }
 
 func (a *attributesWriter) build() ([]byte, error) {
