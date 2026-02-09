@@ -6,7 +6,7 @@ package mpq
 import "encoding/binary"
 
 const (
-	attributesVersion = 100
+	attributesVersion   = 100
 	attributesFlagCRC32 = 0x00000001
 )
 

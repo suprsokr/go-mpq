@@ -39,7 +39,7 @@ func (a *Archive) writeArchive() error {
 	for range a.pendingFiles {
 		actualFileCount++
 	}
-	
+
 	// Calculate total block count including special files
 	// We'll add: (listfile) and (attributes) if they exist
 	totalBlockCount := actualFileCount
@@ -47,7 +47,7 @@ func (a *Archive) writeArchive() error {
 		totalBlockCount++ // (listfile)
 		totalBlockCount++ // (attributes)
 	}
-	
+
 	a.blockTable = make([]blockTableEntryEx, 0, totalBlockCount)
 	listFileContent := ""
 	// Attributes file must include entries for ALL files in block table
@@ -317,7 +317,7 @@ func (a *Archive) writeArchive() error {
 
 	// Get archive size (total file size from start of header)
 	totalFileSize, _ := file.Seek(0, 1)
-	
+
 	// Archive size in header should be the size of the archive data section
 	// (everything after the header), not the total file size.
 	// This is what warcraft-rs expects for validation.
